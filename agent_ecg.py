@@ -1,361 +1,406 @@
 import logging
 import json
-import sys
-import warnings
 from pathlib import Path
-from datetime import datetime
-from typing import Tuple, Dict, Any, List
 
 import numpy as np
 import pandas as pd
-from joblib import dump
-from sklearn.model_selection import StratifiedGroupKFold, RandomizedSearchCV
+from joblib import dump, load
+
+from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import (
     accuracy_score,
     precision_recall_fscore_support,
     roc_auc_score,
     average_precision_score,
-    f1_score,
-    make_scorer
 )
 from sklearn.feature_selection import mutual_info_classif
+
 from xgboost import XGBClassifier
 
-# Suppress warnings for cleaner output
-warnings.filterwarnings("ignore")
-
-# =========================
-# CONFIG
-# =========================
 
 class Config:
     RANDOM_STATE = 42
-    TOP_K_FEATURES = 200          # number of features to keep after MI selection
-    N_FOLDS = 5                   # Number of CV folds
-    N_ITER_SEARCH = 20            # Number of iterations for random search
-    MODEL_DIR = Path("artifacts") # where to save model + scaler + config
+    TOP_K_FEATURES = 200
+    VALID_SIZE_SUBJECTS = 0.2
+    MODEL_DIR = Path("artifacts")
     CSV_PATH = Path("ml_ready_balanced.csv")
-    LOG_FILE = "training.log"
 
-    # Hyperparameter search space for XGBoost
-    XGB_PARAM_DIST = {
-        "n_estimators": [100, 200, 300, 500, 700],
-        "max_depth": [3, 4, 5, 6, 8, 10],
-        "learning_rate": [0.01, 0.03, 0.05, 0.1, 0.2],
-        "subsample": [0.6, 0.7, 0.8, 0.9, 1.0],
-        "colsample_bytree": [0.6, 0.7, 0.8, 0.9, 1.0],
-        "gamma": [0, 0.1, 0.2, 0.5],
-        "min_child_weight": [1, 3, 5, 7],
-    }
+    XGB_PARAM_GRID = [
+        {
+            "n_estimators": 300,
+            "max_depth": 4,
+            "learning_rate": 0.05,
+            "subsample": 0.8,
+            "colsample_bytree": 0.8,
+        },
+        {
+            "n_estimators": 500,
+            "max_depth": 4,
+            "learning_rate": 0.05,
+            "subsample": 0.8,
+            "colsample_bytree": 0.8,
+        },
+        {
+            "n_estimators": 500,
+            "max_depth": 6,
+            "learning_rate": 0.05,
+            "subsample": 0.8,
+            "colsample_bytree": 0.8,
+        },
+        {
+            "n_estimators": 700,
+            "max_depth": 6,
+            "learning_rate": 0.03,
+            "subsample": 0.9,
+            "colsample_bytree": 0.9,
+        },
+    ]
 
-# =========================
-# LOGGING
-# =========================
 
-def setup_logging():
-    """Configure logging to both file and console."""
-    # Create a custom logger
-    logger = logging.getLogger()
-    logger.setLevel(logging.INFO)
+logging.basicConfig(
+    level=logging.INFO,
+    format="[%(asctime)s] [%(levelname)s] %(message)s",
+)
 
-    # Create handlers
-    c_handler = logging.StreamHandler(sys.stdout)
-    f_handler = logging.FileHandler(Config.LOG_FILE, mode='w')
-
-    # Create formatters and add it to handlers
-    log_format = logging.Formatter("[%(asctime)s] [%(levelname)s] %(message)s")
-    c_handler.setFormatter(log_format)
-    f_handler.setFormatter(log_format)
-
-    # Add handlers to the logger
-    # Remove existing handlers to avoid duplicates if re-run
-    if logger.hasHandlers():
-        logger.handlers.clear()
-    
-    logger.addHandler(c_handler)
-    logger.addHandler(f_handler)
-    return logger
-
-logger = setup_logging()
-
-# =========================
-# DATA LOADING & PREPROCESSING
-# =========================
 
 def load_ecg_data(csv_path: Path) -> pd.DataFrame:
-    """Load and filter ECG data."""
-    try:
-        logger.info(f"Loading data from {csv_path}")
-        if not csv_path.exists():
-            raise FileNotFoundError(f"File not found: {csv_path}")
-            
-        df = pd.read_csv(csv_path)
-        ecg_df = df[df["Modality"] == "ECG"].copy()
-        
-        if ecg_df.empty:
-            raise ValueError("No ECG data found in the CSV.")
-            
-        logger.info(f"Total ECG rows: {len(ecg_df)}")
-        logger.info(f"Label distribution (ECG):\n{ecg_df['Label'].value_counts()}")
-        return ecg_df
-    except Exception as e:
-        logger.error(f"Error loading data: {e}")
-        raise
+    logging.info(f"Loading data from {csv_path}")
+    df = pd.read_csv(csv_path)
+    ecg_df = df[df["Modality"] == "ECG"].copy()
+    logging.info(f"Total ECG rows: {len(ecg_df)}")
+    logging.info("Label distribution (ECG):\n%s", ecg_df["Label"].value_counts())
+    return ecg_df
 
-def preprocess_data(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Series, pd.Series]:
-    """
-    Drop metadata, handle categorical features, and prepare X, y, groups.
-    """
-    logger.info("Preprocessing data...")
-    
-    # Metadata columns to drop
-    metadata_cols = [
-        "Modality", "split", "Onset_Seconds", "Duration_Seconds", "Epoch_Index"
-    ]
-    
-    # Extract groups (Subject_ID) before dropping
-    groups = df["Subject_ID"]
-    
-    # Drop metadata
-    X = df.drop(columns=["Label", "Subject_ID"] + [c for c in metadata_cols if c in df.columns])
-    y = df["Label"]
-    
-    # Categorical encoding (e.g., Sex)
-    if "Sex" in X.columns:
-        X = pd.get_dummies(X, columns=["Sex"], drop_first=True)
-        
-    logger.info(f"Feature dimension: {X.shape[1]}")
-    return X, y, groups
 
-# =========================
-# FEATURE SELECTION & SCALING
-# =========================
+def subject_wise_split(ecg_df: pd.DataFrame, valid_size_subjects: float, random_state: int):
+    train_subjects = ecg_df.loc[ecg_df["split"] == "train", "Subject_ID"].unique()
+    test_subjects = ecg_df.loc[ecg_df["split"] == "test", "Subject_ID"].unique()
 
-def select_features_and_scale(X_train, y_train, X_val=None, top_k=200):
-    """
-    Select top k features using Mutual Information and scale data.
-    Returns scaler, selected_indices, and transformed data.
-    """
-    # 1. Feature Selection
-    logger.info(f"Running MI feature selection (top {top_k})...")
-    mi = mutual_info_classif(X_train, y_train, random_state=Config.RANDOM_STATE)
-    selected_indices = np.argsort(mi)[::-1][:top_k]
-    
-    X_train_sel = X_train.iloc[:, selected_indices]
-    
-    # 2. Scaling
-    scaler = StandardScaler()
-    X_train_scaled = scaler.fit_transform(X_train_sel)
-    
-    X_val_scaled = None
-    if X_val is not None:
-        X_val_sel = X_val.iloc[:, selected_indices]
-        X_val_scaled = scaler.transform(X_val_sel)
-        
-    return scaler, selected_indices, X_train_scaled, X_val_scaled
-
-# =========================
-# MODEL TRAINING & EVALUATION
-# =========================
-
-def tune_hyperparameters(X_train, y_train, random_state):
-    """
-    Use RandomizedSearchCV to find best XGBoost hyperparameters.
-    """
-    logger.info("Tuning hyperparameters...")
-    xgb = XGBClassifier(
-        objective="binary:logistic",
-        eval_metric="logloss",
-        tree_method="hist",
-        n_jobs=-1,
-        random_state=random_state
-    )
-    
-    scorer = make_scorer(f1_score)
-    
-    search = RandomizedSearchCV(
-        xgb,
-        param_distributions=Config.XGB_PARAM_DIST,
-        n_iter=Config.N_ITER_SEARCH,
-        scoring=scorer,
-        cv=3, # Internal CV for hyperparam tuning
-        verbose=1,
+    train_subj, val_subj = train_test_split(
+        train_subjects,
+        test_size=valid_size_subjects,
         random_state=random_state,
-        n_jobs=-1
+        shuffle=True,
     )
-    
-    search.fit(X_train, y_train)
-    logger.info(f"Best params: {search.best_params_}")
-    logger.info(f"Best internal CV F1: {search.best_score_:.4f}")
-    
-    return search.best_estimator_, search.best_params_
 
-def find_best_threshold(y_true, y_scores):
-    """Find the threshold that maximizes F1 score."""
-    thresholds = np.linspace(0.1, 0.9, 81)
+    train_df = ecg_df[ecg_df["Subject_ID"].isin(train_subj)].copy()
+    val_df   = ecg_df[ecg_df["Subject_ID"].isin(val_subj)].copy()
+    test_df  = ecg_df[ecg_df["Subject_ID"].isin(test_subjects)].copy()
+
+    logging.info("Train subjects: %d", len(np.unique(train_df["Subject_ID"])))
+    logging.info("Val subjects:   %d", len(np.unique(val_df["Subject_ID"])))
+    logging.info("Test subjects:  %d", len(np.unique(test_df["Subject_ID"])))
+
+    return train_df, val_df, test_df
+
+
+METADATA_COLS = [
+    "Subject_ID",
+    "Modality",
+    "split",
+    "Onset_Seconds",
+    "Duration_Seconds",
+    "Epoch_Index",
+]
+
+def drop_metadata(train_df, val_df, test_df):
+    for col in METADATA_COLS:
+        if col in train_df.columns:
+            train_df = train_df.drop(columns=[col])
+            val_df   = val_df.drop(columns=[col])
+            test_df  = test_df.drop(columns=[col])
+    return train_df, val_df, test_df
+
+
+def encode_and_scale(train_df, val_df, test_df, random_state: int):
+    y_train = train_df["Label"].values
+    y_val   = val_df["Label"].values
+    y_test  = test_df["Label"].values
+
+    X_train = train_df.drop(columns=["Label"])
+    X_val   = val_df.drop(columns=["Label"])
+    X_test  = test_df.drop(columns=["Label"])
+
+    categorical_cols = []
+    if "Sex" in X_train.columns:
+        categorical_cols.append("Sex")
+
+    X_train_enc = pd.get_dummies(X_train, columns=categorical_cols, drop_first=True)
+    X_val_enc   = pd.get_dummies(X_val,   columns=categorical_cols, drop_first=True)
+    X_test_enc  = pd.get_dummies(X_test,  columns=categorical_cols, drop_first=True)
+
+    X_val_enc  = X_val_enc.reindex(columns=X_train_enc.columns, fill_value=0)
+    X_test_enc = X_test_enc.reindex(columns=X_train_enc.columns, fill_value=0)
+
+    feature_names = list(X_train_enc.columns)
+    logging.info("Feature dimension after encoding: %d", len(feature_names))
+
+    scaler = StandardScaler()
+    X_train_scaled = scaler.fit_transform(X_train_enc)
+    X_val_scaled   = scaler.transform(X_val_enc)
+    X_test_scaled  = scaler.transform(X_test_enc)
+
+    return (
+        X_train_scaled,
+        X_val_scaled,
+        X_test_scaled,
+        y_train,
+        y_val,
+        y_test,
+        feature_names,
+        scaler,
+    )
+
+
+def feature_selection_mi(X_train, y_train, X_val, X_test, top_k: int):
+    logging.info("Running mutual information feature selection...")
+    mi = mutual_info_classif(X_train, y_train, random_state=Config.RANDOM_STATE)
+    idx_sorted = np.argsort(mi)[::-1]
+    k = min(top_k, X_train.shape[1])
+    top_idx = idx_sorted[:k]
+
+    X_train_sel = X_train[:, top_idx]
+    X_val_sel   = X_val[:, top_idx]
+    X_test_sel  = X_test[:, top_idx]
+
+    logging.info("Selected top %d features.", X_train_sel.shape[1])
+    return X_train_sel, X_val_sel, X_test_sel, top_idx, mi[top_idx]
+
+
+def evaluate_threshold(y_true, y_scores, threshold):
+    y_pred = (y_scores >= threshold).astype(int)
+    acc = accuracy_score(y_true, y_pred)
+    prec, rec, f1, _ = precision_recall_fscore_support(
+        y_true, y_pred, average="binary", zero_division=0
+    )
+    return acc, prec, rec, f1
+
+
+def find_best_threshold(y_true, y_scores, metric="f1"):
     best_thr = 0.5
-    best_f1 = -1.0
-    
-    for thr in thresholds:
-        y_pred = (y_scores >= thr).astype(int)
-        f1 = f1_score(y_true, y_pred, zero_division=0)
-        if f1 > best_f1:
-            best_f1 = f1
-            best_thr = thr
-            
-    return best_thr, best_f1
+    best_score = -1.0
+    best_tuple = None
 
-def evaluate_model(model, X_test, y_test, threshold=0.5):
-    """Calculate various metrics on test set."""
-    y_probs = model.predict_proba(X_test)[:, 1]
-    y_pred = (y_probs >= threshold).astype(int)
-    
-    acc = accuracy_score(y_test, y_pred)
-    prec, rec, f1, _ = precision_recall_fscore_support(y_test, y_pred, average="binary", zero_division=0)
-    
+    thresholds = np.linspace(0.1, 0.9, 17)
+    for thr in thresholds:
+        acc, prec, rec, f1 = evaluate_threshold(y_true, y_scores, thr)
+        score = {"f1": f1, "recall": rec, "precision": prec, "accuracy": acc}[metric]
+        if score > best_score:
+            best_score = score
+            best_thr = thr
+            best_tuple = (acc, prec, rec, f1)
+
+    logging.info(
+        "Best threshold on val (metric=%s): %.3f -> Acc=%.3f, Prec=%.3f, Rec=%.3f, F1=%.3f",
+        metric,
+        best_thr,
+        best_tuple[0],
+        best_tuple[1],
+        best_tuple[2],
+        best_tuple[3],
+    )
+
+    return best_thr, best_tuple
+
+
+def train_and_select_xgb(
+    X_train,
+    y_train,
+    X_val,
+    y_val,
+    param_grid,
+    random_state: int,
+):
+    best_model = None
+    best_params = None
+    best_thr = 0.5
+    best_val_f1 = -1.0
+    best_val_metrics = None
+
+    for i, params in enumerate(param_grid):
+        logging.info("Training XGBoost config %d/%d: %s", i + 1, len(param_grid), params)
+
+        model = XGBClassifier(
+            objective="binary:logistic",
+            eval_metric="logloss",
+            tree_method="hist",
+            n_jobs=-1,
+            random_state=Config.RANDOM_STATE,
+            **params,
+        )
+        model.fit(X_train, y_train)
+
+        y_val_scores = model.predict_proba(X_val)[:, 1]
+
+        thr, (acc, prec, rec, f1) = find_best_threshold(y_val, y_val_scores, metric="f1")
+
+        logging.info(
+            "Config %d -> Val F1=%.3f (thr=%.3f, Acc=%.3f, Prec=%.3f, Rec=%.3f)",
+            i + 1,
+            f1,
+            thr,
+            acc,
+            prec,
+            rec,
+        )
+
+        if f1 > best_val_f1:
+            best_val_f1 = f1
+            best_model = model
+            best_params = params
+            best_thr = thr
+            best_val_metrics = (acc, prec, rec, f1)
+
+    logging.info("Best XGBoost params: %s", best_params)
+    logging.info(
+        "Best val F1: %.3f at threshold %.3f (Acc=%.3f, Prec=%.3f, Rec=%.3f)",
+        best_val_f1,
+        best_thr,
+        best_val_metrics[0],
+        best_val_metrics[1],
+        best_val_metrics[2],
+    )
+
+    return best_model, best_params, best_thr
+
+
+def evaluate_on_test(model, threshold, X_test, y_test):
+    y_scores = model.predict_proba(X_test)[:, 1]
+    acc, prec, rec, f1 = evaluate_threshold(y_test, y_scores, threshold)
+
     try:
-        roc = roc_auc_score(y_test, y_probs)
-        pr_auc = average_precision_score(y_test, y_probs)
-    except:
-        roc, pr_auc = np.nan, np.nan
-        
+        roc = roc_auc_score(y_test, y_scores)
+        pr_auc = average_precision_score(y_test, y_scores)
+    except Exception:
+        roc = np.nan
+        pr_auc = np.nan
+
+    logging.info(
+        "TEST -> Thr=%.3f | Acc=%.3f, Prec=%.3f, Rec=%.3f, F1=%.3f, ROC-AUC=%.3f, PR-AUC=%.3f",
+        threshold,
+        acc,
+        prec,
+        rec,
+        f1,
+        roc,
+        pr_auc,
+    )
+
     return {
         "accuracy": acc,
         "precision": prec,
         "recall": rec,
         "f1": f1,
         "roc_auc": roc,
-        "pr_auc": pr_auc
+        "pr_auc": pr_auc,
     }
 
-# =========================
-# MAIN PIPELINE
-# =========================
 
-def run_cross_validation(X, y, groups):
-    """Run Stratified Group K-Fold CV."""
-    sgkf = StratifiedGroupKFold(n_splits=Config.N_FOLDS)
-    
-    fold_metrics = []
-    
-    logger.info(f"Starting {Config.N_FOLDS}-Fold Stratified Group Cross-Validation...")
-    
-    for fold, (train_idx, val_idx) in enumerate(sgkf.split(X, y, groups)):
-        logger.info(f"=== Fold {fold+1}/{Config.N_FOLDS} ===")
-        
-        X_train, y_train = X.iloc[train_idx], y.iloc[train_idx]
-        X_val, y_val = X.iloc[val_idx], y.iloc[val_idx]
-        
-        # Feature Selection & Scaling
-        scaler, selected_idx, X_train_scaled, X_val_scaled = select_features_and_scale(
-            X_train, y_train, X_val, top_k=Config.TOP_K_FEATURES
-        )
-        
-        # Hyperparameter Tuning (on this fold's training data)
-        # To save time in this demo, we could use fixed params, but let's do a quick search
-        # or use the best params from a previous run if we wanted to be faster.
-        # Here we do a full search per fold to be "production ready" and robust.
-        best_model, _ = tune_hyperparameters(X_train_scaled, y_train, Config.RANDOM_STATE)
-        
-        # Find best threshold on validation set
-        y_val_probs = best_model.predict_proba(X_val_scaled)[:, 1]
-        best_thr, val_f1 = find_best_threshold(y_val, y_val_probs)
-        
-        # Evaluate
-        metrics = evaluate_model(best_model, X_val_scaled, y_val, best_thr)
-        metrics['threshold'] = best_thr
-        fold_metrics.append(metrics)
-        
-        logger.info(f"Fold {fold+1} Metrics: F1={metrics['f1']:.4f}, Acc={metrics['accuracy']:.4f}, Thr={best_thr:.3f}")
+def save_artifacts(
+    model,
+    scaler,
+    feature_names,
+    selected_indices,
+    threshold,
+    metrics,
+    config: Config,
+):
+    MODEL_DIR = config.MODEL_DIR
+    MODEL_DIR.mkdir(parents=True, exist_ok=True)
 
-    # Aggregate results
-    metrics_df = pd.DataFrame(fold_metrics)
-    logger.info("\n=== Cross-Validation Results ===")
-    logger.info(f"\n{metrics_df.describe().T[['mean', 'std']]}")
-    
-    return metrics_df.mean().to_dict()
+    model_path = MODEL_DIR / "xgb_ecg_seizure_model.joblib"
+    scaler_path = MODEL_DIR / "scaler.joblib"
+    info_path = MODEL_DIR / "model_info.json"
 
-def train_final_model(X, y):
-    """Train the final model on the entire dataset."""
-    logger.info("Training final model on full dataset...")
-    
-    # Feature Selection & Scaling on full data
-    scaler, selected_idx, X_scaled, _ = select_features_and_scale(X, y, top_k=Config.TOP_K_FEATURES)
-    
-    # Hyperparameter Tuning on full data
-    best_model, best_params = tune_hyperparameters(X_scaled, y, Config.RANDOM_STATE)
-    
-    # We don't have a validation set to tune threshold here, so we use the average threshold from CV
-    # Or we could do a nested split, but for simplicity/production, we often use 0.5 or a conservative value.
-    # A better approach: use the threshold that gave best F1 in CV (averaged).
-    
-    return best_model, scaler, selected_idx, best_params
-
-def save_artifacts(model, scaler, feature_names, selected_indices, metrics, config, avg_threshold):
-    """Save model and metadata."""
-    Config.MODEL_DIR.mkdir(parents=True, exist_ok=True)
-    
-    model_path = Config.MODEL_DIR / "xgb_ecg_seizure_model.joblib"
-    scaler_path = Config.MODEL_DIR / "scaler.joblib"
-    info_path = Config.MODEL_DIR / "model_info.json"
-    
     dump(model, model_path)
     dump(scaler, scaler_path)
-    
-    # Get names of selected features
-    selected_names = [feature_names[i] for i in selected_indices]
-    
+
     info = {
-        "cv_metrics_mean": metrics,
-        "final_threshold_estimated": avg_threshold,
+        "threshold": float(threshold),
         "selected_feature_indices": selected_indices.tolist(),
-        "feature_names": selected_names,
+        "feature_names": feature_names,
+        "test_metrics": metrics,
         "config": {
             "TOP_K_FEATURES": config.TOP_K_FEATURES,
-            "N_FOLDS": config.N_FOLDS,
+            "VALID_SIZE_SUBJECTS": config.VALID_SIZE_SUBJECTS,
             "RANDOM_STATE": config.RANDOM_STATE,
         },
-        "timestamp": datetime.now().isoformat()
     }
-    
+
     with open(info_path, "w", encoding="utf-8") as f:
         json.dump(info, f, indent=2)
-        
-    logger.info(f"Artifacts saved to {Config.MODEL_DIR}")
+
+    logging.info("Saved model to %s", model_path)
+    logging.info("Saved scaler to %s", scaler_path)
+    logging.info("Saved model info to %s", info_path)
+
 
 def main():
-    try:
-        # 1. Load Data
-        ecg_df = load_ecg_data(Config.CSV_PATH)
-        
-        # 2. Preprocess
-        X, y, groups = preprocess_data(ecg_df)
-        feature_names = list(X.columns)
-        
-        # 3. Cross-Validation
-        avg_metrics = run_cross_validation(X, y, groups)
-        avg_threshold = avg_metrics['threshold']
-        
-        # 4. Final Training
-        final_model, scaler, selected_idx, best_params = train_final_model(X, y)
-        
-        # 5. Save Artifacts
-        save_artifacts(
-            final_model, 
-            scaler, 
-            feature_names, 
-            selected_idx, 
-            avg_metrics, 
-            Config, 
-            avg_threshold
-        )
-        
-        logger.info("Pipeline completed successfully.")
-        
-    except Exception as e:
-        logger.critical(f"Pipeline failed: {e}", exc_info=True)
-        sys.exit(1)
+    cfg = Config()
+    np.random.seed(cfg.RANDOM_STATE)
+
+    ecg_df = load_ecg_data(cfg.CSV_PATH)
+
+    train_df, val_df, test_df = subject_wise_split(
+        ecg_df, valid_size_subjects=cfg.VALID_SIZE_SUBJECTS, random_state=cfg.RANDOM_STATE
+    )
+
+    train_df, val_df, test_df = drop_metadata(train_df, val_df, test_df)
+
+    (
+        X_train_scaled,
+        X_val_scaled,
+        X_test_scaled,
+        y_train,
+        y_val,
+        y_test,
+        feature_names,
+        scaler,
+    ) = encode_and_scale(train_df, val_df, test_df, random_state=cfg.RANDOM_STATE)
+
+    (
+        X_train_sel,
+        X_val_sel,
+        X_test_sel,
+        selected_idx,
+        selected_mi,
+    ) = feature_selection_mi(
+        X_train_scaled,
+        y_train,
+        X_val_scaled,
+        X_test_scaled,
+        top_k=cfg.TOP_K_FEATURES,
+    )
+
+    best_model, best_params, best_thr = train_and_select_xgb(
+        X_train_sel,
+        y_train,
+        X_val_sel,
+        y_val,
+        cfg.XGB_PARAM_GRID,
+        random_state=cfg.RANDOM_STATE,
+    )
+
+    test_metrics = evaluate_on_test(
+        best_model,
+        best_thr,
+        X_test_sel,
+        y_test,
+    )
+
+    selected_feature_names = [feature_names[i] for i in selected_idx]
+    save_artifacts(
+        model=best_model,
+        scaler=scaler,
+        feature_names=selected_feature_names,
+        selected_indices=selected_idx,
+        threshold=best_thr,
+        metrics=test_metrics,
+        config=cfg,
+    )
+
+    logging.info("Training pipeline completed.")
 
 if __name__ == "__main__":
     main()
